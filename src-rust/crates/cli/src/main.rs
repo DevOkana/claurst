@@ -1181,10 +1181,19 @@ async fn run_interactive(
                         continue;
                     }
 
-                    // Ctrl+C while streaming => cancel
+                    // Ctrl+C: copy selected text if there's a selection, otherwise cancel/quit
                     if key.code == KeyCode::Char('c')
                         && key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
                     {
+                        // Check if there's an active text selection — copy instead of cancel/quit
+                        let has_selection = app.selection_anchor.is_some() && !app.selection_text.borrow().is_empty();
+                        if has_selection {
+                            // Let the app handle the copy via its normal key handler
+                            app.handle_key_event(key);
+                            continue;
+                        }
+
+                        // No selection — handle as cancel (if streaming) or quit
                         if app.is_streaming {
                             if let Some(ref ct) = cancel {
                                 ct.cancel();
@@ -1606,14 +1615,10 @@ async fn run_interactive(
                         session.updated_at = chrono::Utc::now();
                     }
                 }
-                Event::Mouse(mouse_event) => {
-                    // Forward mouse events to the app (trackpad scroll, text selection, etc.)
-                    app.handle_mouse_event(mouse_event);
-                }
                 Event::Resize(_, _) => {
                     // Terminal resize - will be handled on next draw
                 }
-                _ => {}
+                _ => {}  // Other events (mouse, paste, etc.) are handled by the terminal
             }
         }
 

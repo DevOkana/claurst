@@ -688,6 +688,9 @@ fn render_messages(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
+    // Store the actual message pane bounds for mouse event handling (text selection, scrolling).
+    app.last_msg_area.set(msg_area);
+
     let lines = render_message_items(app, msg_area.width);
 
     // Highlight search matches in transcript when global search is active
