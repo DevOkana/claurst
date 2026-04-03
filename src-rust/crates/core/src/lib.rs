@@ -3,6 +3,10 @@
 //
 // All sub-modules are defined inline below.
 
+// Branded provider / model identifier newtypes.
+pub mod provider_id;
+pub use provider_id::{ProviderId, ModelId};
+
 // Session transcript persistence (JSONL, matches TS sessionStorage.ts schema).
 pub mod session_storage;
 
@@ -33,6 +37,9 @@ pub mod message_utils;
 // Per-session file modification history (T4-6).
 pub mod file_history;
 
+// Snapshot/undo system — tracks file changes per session for /undo support.
+pub mod snapshot;
+
 // Feature flag management via GrowthBook.
 pub mod feature_flags;
 
@@ -45,10 +52,11 @@ pub use types::{
     ContentBlock, ImageSource, DocumentSource, CitationsConfig, Message, MessageContent,
     MessageCost, Role, ToolDefinition, ToolResultContent, UsageInfo,
 };
-pub use config::{Config, McpServerConfig, OutputFormat, PermissionMode, Settings, Theme};
+pub use config::{Config, McpServerConfig, OutputFormat, PermissionMode, ProviderConfig, Settings, Theme};
 pub use cost::CostTracker;
 pub use history::ConversationSession;
 pub use feature_flags::FeatureFlagManager;
+pub use snapshot::SnapshotManager;
 pub use permissions::{
     AutoPermissionHandler, InteractivePermissionHandler,
     ManagedAutoPermissionHandler, ManagedInteractivePermissionHandler,
@@ -578,6 +586,48 @@ pub mod config {
         pub blocking: bool,
     }
 
+    // ---- ProviderConfig --------------------------------------------------
+
+    fn default_true() -> bool {
+        true
+    }
+
+    /// Per-provider configuration: API keys, base URLs, and options.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct ProviderConfig {
+        /// API key (overrides environment variable)
+        pub api_key: Option<String>,
+        /// Override the default base URL for this provider
+        pub api_base: Option<String>,
+        /// Whether this provider is enabled (default: true)
+        #[serde(default = "default_true")]
+        pub enabled: bool,
+        /// Model ID whitelist (empty = allow all)
+        #[serde(default)]
+        pub models_whitelist: Vec<String>,
+        /// Model ID blacklist
+        #[serde(default)]
+        pub models_blacklist: Vec<String>,
+        /// Provider-specific options (passed through to provider implementation)
+        #[serde(default)]
+        pub options: HashMap<String, serde_json::Value>,
+    }
+
+    impl Default for ProviderConfig {
+        fn default() -> Self {
+            Self {
+                api_key: None,
+                api_base: None,
+                enabled: true,
+                models_whitelist: Vec::new(),
+                models_blacklist: Vec::new(),
+                options: HashMap::new(),
+            }
+        }
+    }
+
+    // ---- Config ----------------------------------------------------------
+
     /// Top-level configuration values, merged from CLI args + settings file + env.
     #[derive(Debug, Clone, Serialize, Deserialize, Default)]
     pub struct Config {
@@ -611,6 +661,12 @@ pub mod config {
         /// Event hooks: map of event → list of hook commands.
         #[serde(default)]
         pub hooks: HashMap<HookEvent, Vec<HookEntry>>,
+        /// Active provider ID (default: "anthropic")
+        #[serde(default)]
+        pub provider: Option<String>,
+        /// Per-provider configurations
+        #[serde(default)]
+        pub provider_configs: HashMap<String, ProviderConfig>,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -687,6 +743,12 @@ pub mod config {
         /// App version at last launch — used to detect upgrades and show release notes.
         #[serde(default, rename = "lastSeenVersion")]
         pub last_seen_version: Option<String>,
+        /// Active provider ID at the settings level (e.g. "anthropic", "openai").
+        #[serde(default)]
+        pub provider: Option<String>,
+        /// Per-provider configurations stored in settings.json.
+        #[serde(default)]
+        pub providers: HashMap<String, ProviderConfig>,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -876,6 +938,25 @@ pub mod config {
             std::fs::write(&path, content)?;
             Ok(())
         }
+
+        /// Return the effective `Config`, merging top-level provider settings
+        /// into the embedded `config` field.
+        ///
+        /// - `settings.provider` wins over `settings.config.provider` (if set).
+        /// - `settings.providers` entries are merged into `config.provider_configs`,
+        ///   with the embedded config values taking precedence for keys already present.
+        pub fn effective_config(&self) -> Config {
+            let mut config = self.config.clone();
+            // Top-level `provider` key overrides config.provider when set.
+            if self.provider.is_some() && config.provider.is_none() {
+                config.provider = self.provider.clone();
+            }
+            // Merge top-level `providers` map into config.provider_configs.
+            for (id, pc) in &self.providers {
+                config.provider_configs.entry(id.clone()).or_insert_with(|| pc.clone());
+            }
+            config
+        }
     }
 }
 
@@ -934,6 +1015,8 @@ pub mod constants {
     pub const TOOL_NAME_ASK_USER: &str = "AskUserQuestion";
     pub const TOOL_NAME_MCP: &str = "mcp";
     pub const TOOL_NAME_NOTEBOOK_EDIT: &str = "NotebookEdit";
+    pub const TOOL_NAME_BATCH_EDIT: &str = "BatchEdit";
+    pub const TOOL_NAME_APPLY_PATCH: &str = "ApplyPatch";
 
     // Session ID prefixes
     pub const SESSION_ID_PREFIX_BASH: &str = "b";

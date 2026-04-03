@@ -15,7 +15,8 @@
 //   4. Track state so we don't re-extract from already-processed messages.
 
 use claurst_api::{
-    ApiMessage, CreateMessageRequest, StreamAccumulator, StreamEvent, StreamHandler, SystemPrompt,
+    AnthropicStreamEvent, ApiMessage, CreateMessageRequest, StreamAccumulator, StreamHandler,
+    SystemPrompt,
 };
 use claurst_core::types::{Message, Role};
 use serde_json::Value;
@@ -259,7 +260,7 @@ impl SessionMemoryExtractor {
         let mut acc = StreamAccumulator::new();
         while let Some(evt) = rx.recv().await {
             acc.on_event(&evt);
-            if matches!(evt, StreamEvent::MessageStop) {
+            if matches!(evt, AnthropicStreamEvent::MessageStop) {
                 break;
             }
         }

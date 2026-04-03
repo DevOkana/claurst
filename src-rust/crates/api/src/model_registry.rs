@@ -1,0 +1,351 @@
+// model_registry.rs — Model Registry with bundled snapshot and optional
+// models.dev refresh (Phase 3).
+//
+// The registry is pre-populated with a hardcoded snapshot of popular models
+// from Anthropic, OpenAI, and Google.  At runtime callers may optionally call
+// `refresh_from_models_dev` to extend/update the registry from the public
+// models.dev API.  All network failures are swallowed — the bundled snapshot
+// is always sufficient for normal operation.
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
+
+use claurst_core::provider_id::{ModelId, ProviderId};
+
+use crate::provider::ModelInfo;
+
+// ---------------------------------------------------------------------------
+// ModelEntry
+// ---------------------------------------------------------------------------
+
+/// Extended model information with pricing and capability flags.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ModelEntry {
+    pub info: ModelInfo,
+    /// USD per 1M input tokens (`None` = unknown / free).
+    pub cost_input: Option<f64>,
+    /// USD per 1M output tokens.
+    pub cost_output: Option<f64>,
+    /// Cache read pricing per 1M tokens.
+    pub cost_cache_read: Option<f64>,
+    /// Cache write pricing per 1M tokens.
+    pub cost_cache_write: Option<f64>,
+    /// Supports tool / function calling.
+    pub tool_calling: bool,
+    /// Supports extended thinking / reasoning.
+    pub reasoning: bool,
+    /// Supports vision / image input.
+    pub vision: bool,
+    /// Model family (e.g. `"claude"`, `"gpt"`, `"gemini"`).
+    pub family: Option<String>,
+    /// Human-readable status: `"active"`, `"beta"`, or `"deprecated"`.
+    pub status: String,
+}
+
+// ---------------------------------------------------------------------------
+// ModelRegistry
+// ---------------------------------------------------------------------------
+
+pub struct ModelRegistry {
+    /// Keyed by `"provider_id/model_id"`.
+    entries: HashMap<String, ModelEntry>,
+    /// Optional path for on-disk persistence between sessions.
+    cache_path: Option<PathBuf>,
+    /// When the registry was last refreshed from the network.
+    last_refresh: Option<Instant>,
+    /// Minimum age before a network refresh is attempted again.
+    refresh_interval: Duration,
+}
+
+impl ModelRegistry {
+    /// Create a new registry pre-populated with the bundled snapshot.
+    pub fn new() -> Self {
+        let mut registry = Self {
+            entries: HashMap::new(),
+            cache_path: None,
+            last_refresh: None,
+            refresh_interval: Duration::from_secs(5 * 60),
+        };
+        registry.load_bundled_snapshot();
+        registry
+    }
+
+    /// Configure a cache file path for persistence between sessions.
+    pub fn with_cache_path(mut self, path: PathBuf) -> Self {
+        self.cache_path = Some(path);
+        self
+    }
+
+    // -----------------------------------------------------------------------
+    // Bundled snapshot
+    // -----------------------------------------------------------------------
+
+    fn load_bundled_snapshot(&mut self) {
+        self.add_anthropic_models();
+        self.add_openai_models();
+        self.add_google_models();
+    }
+
+    fn add_anthropic_models(&mut self) {
+        let pid = ProviderId::new(ProviderId::ANTHROPIC);
+        for (id, name, ctx, out, cost_in, cost_out) in [
+            ("claude-opus-4-6",           "Claude Opus 4.6",    200_000u32, 32_000u32, 15.0f64, 75.0f64),
+            ("claude-sonnet-4-6",         "Claude Sonnet 4.6",  200_000,    16_000,     3.0,    15.0),
+            ("claude-haiku-4-5-20251001", "Claude Haiku 4.5",   200_000,     8_096,     0.8,     4.0),
+        ] {
+            self.insert(ModelEntry {
+                info: ModelInfo {
+                    id: ModelId::new(id),
+                    provider_id: pid.clone(),
+                    name: name.to_string(),
+                    context_window: ctx,
+                    max_output_tokens: out,
+                },
+                cost_input: Some(cost_in),
+                cost_output: Some(cost_out),
+                cost_cache_read: Some(cost_in * 0.1),
+                cost_cache_write: Some(cost_in * 1.25),
+                tool_calling: true,
+                reasoning: true,
+                vision: true,
+                family: Some("claude".to_string()),
+                status: "active".to_string(),
+            });
+        }
+    }
+
+    fn add_openai_models(&mut self) {
+        let pid = ProviderId::new(ProviderId::OPENAI);
+        for (id, name, ctx, out, cost_in, cost_out, tools, reasoning) in [
+            ("gpt-4o",      "GPT-4o",        128_000u32, 16_384u32,  2.5f64, 10.0f64, true,  false),
+            ("gpt-4o-mini", "GPT-4o mini",   128_000,    16_384,     0.15,    0.6,    true,  false),
+            ("o3",          "o3",            200_000,   100_000,    10.0,   40.0,    true,  true),
+            ("o4-mini",     "o4-mini",       200_000,   100_000,     1.1,    4.4,    true,  true),
+        ] {
+            self.insert(ModelEntry {
+                info: ModelInfo {
+                    id: ModelId::new(id),
+                    provider_id: pid.clone(),
+                    name: name.to_string(),
+                    context_window: ctx,
+                    max_output_tokens: out,
+                },
+                cost_input: Some(cost_in),
+                cost_output: Some(cost_out),
+                cost_cache_read: None,
+                cost_cache_write: None,
+                tool_calling: tools,
+                reasoning,
+                vision: true,
+                family: Some("gpt".to_string()),
+                status: "active".to_string(),
+            });
+        }
+    }
+
+    fn add_google_models(&mut self) {
+        let pid = ProviderId::new(ProviderId::GOOGLE);
+        for (id, name, ctx, out, cost_in, cost_out) in [
+            ("gemini-2.5-pro",   "Gemini 2.5 Pro",   1_048_576u32, 65_536u32, 1.25f64, 5.0f64),
+            ("gemini-2.5-flash", "Gemini 2.5 Flash", 1_048_576,    65_536,    0.15,    0.6),
+            ("gemini-2.0-flash", "Gemini 2.0 Flash", 1_048_576,     8_192,    0.1,     0.4),
+        ] {
+            self.insert(ModelEntry {
+                info: ModelInfo {
+                    id: ModelId::new(id),
+                    provider_id: pid.clone(),
+                    name: name.to_string(),
+                    context_window: ctx,
+                    max_output_tokens: out,
+                },
+                cost_input: Some(cost_in),
+                cost_output: Some(cost_out),
+                cost_cache_read: None,
+                cost_cache_write: None,
+                tool_calling: true,
+                reasoning: true,
+                vision: true,
+                family: Some("gemini".to_string()),
+                status: "active".to_string(),
+            });
+        }
+    }
+
+    fn insert(&mut self, entry: ModelEntry) {
+        let key = format!("{}/{}", entry.info.provider_id, entry.info.id);
+        self.entries.insert(key, entry);
+    }
+
+    // -----------------------------------------------------------------------
+    // Queries
+    // -----------------------------------------------------------------------
+
+    /// Get an entry by `"provider_id/model_id"` key.
+    pub fn get(&self, provider_id: &str, model_id: &str) -> Option<&ModelEntry> {
+        let key = format!("{}/{}", provider_id, model_id);
+        self.entries.get(&key)
+    }
+
+    /// Resolve a model string into `(ProviderId, ModelId)`.
+    ///
+    /// Accepts either `"provider/model"` or a bare model name (which defaults
+    /// to the Anthropic provider).
+    pub fn resolve(s: &str) -> (ProviderId, ModelId) {
+        if let Some((provider, model)) = s.split_once('/') {
+            (ProviderId::new(provider), ModelId::new(model))
+        } else {
+            (ProviderId::new(ProviderId::ANTHROPIC), ModelId::new(s))
+        }
+    }
+
+    /// List all models for a given provider.
+    pub fn list_by_provider(&self, provider_id: &str) -> Vec<&ModelEntry> {
+        self.entries
+            .values()
+            .filter(|e| &*e.info.provider_id == provider_id)
+            .collect()
+    }
+
+    /// List every entry in the registry.
+    pub fn list_all(&self) -> Vec<&ModelEntry> {
+        self.entries.values().collect()
+    }
+
+    // -----------------------------------------------------------------------
+    // Network refresh
+    // -----------------------------------------------------------------------
+
+    /// Attempt to refresh the registry from the models.dev public API.
+    ///
+    /// Returns `Ok(true)` if new data was fetched, `Ok(false)` if the cache
+    /// was still fresh.  All network or parse failures are silenced — the
+    /// bundled snapshot is always sufficient.
+    pub async fn refresh_from_models_dev(&mut self) -> anyhow::Result<bool> {
+        if let Some(last) = self.last_refresh {
+            if last.elapsed() < self.refresh_interval {
+                return Ok(false);
+            }
+        }
+
+        let url = std::env::var("MODELS_DEV_URL")
+            .unwrap_or_else(|_| "https://models.dev/api.json".to_string());
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()?;
+
+        let resp = client.get(&url).send().await;
+        match resp {
+            Ok(r) if r.status().is_success() => {
+                let json: serde_json::Value = r.json().await?;
+                self.parse_models_dev_response(&json);
+                self.last_refresh = Some(Instant::now());
+                if let Some(ref path) = self.cache_path.clone() {
+                    self.save_cache(path);
+                }
+                Ok(true)
+            }
+            // Fail silently — bundled snapshot is sufficient.
+            _ => Ok(false),
+        }
+    }
+
+    fn parse_models_dev_response(&mut self, json: &serde_json::Value) {
+        // models.dev format:
+        // { "provider_id": { "models": { "model_id": { "name": "...", "limit": {...}, "cost": {...} } } } }
+        if let Some(obj) = json.as_object() {
+            for (provider_id, provider_data) in obj {
+                if let Some(models) = provider_data
+                    .get("models")
+                    .and_then(|m| m.as_object())
+                {
+                    for (model_id, model_data) in models {
+                        let ctx = model_data
+                            .get("limit")
+                            .and_then(|l| l.get("context"))
+                            .and_then(|c| c.as_u64())
+                            .unwrap_or(4096) as u32;
+                        let out = model_data
+                            .get("limit")
+                            .and_then(|l| l.get("output"))
+                            .and_then(|o| o.as_u64())
+                            .unwrap_or(4096) as u32;
+                        let cost_in = model_data
+                            .get("cost")
+                            .and_then(|c| c.get("input"))
+                            .and_then(|i| i.as_f64());
+                        let cost_out = model_data
+                            .get("cost")
+                            .and_then(|c| c.get("output"))
+                            .and_then(|o| o.as_f64());
+                        let name = model_data
+                            .get("name")
+                            .and_then(|n| n.as_str())
+                            .unwrap_or(model_id)
+                            .to_string();
+                        let tool_calling = model_data
+                            .get("tool_call")
+                            .and_then(|t| t.as_bool())
+                            .unwrap_or(false);
+                        let reasoning = model_data
+                            .get("reasoning")
+                            .and_then(|r| r.as_bool())
+                            .unwrap_or(false);
+
+                        let pid = ProviderId::new(provider_id.as_str());
+                        let mid = ModelId::new(model_id.as_str());
+                        let key = format!("{}/{}", pid, mid);
+
+                        // Only insert if not already present (bundled snapshot wins).
+                        self.entries.entry(key).or_insert_with(|| ModelEntry {
+                            info: ModelInfo {
+                                id: mid,
+                                provider_id: pid,
+                                name,
+                                context_window: ctx,
+                                max_output_tokens: out,
+                            },
+                            cost_input: cost_in,
+                            cost_output: cost_out,
+                            cost_cache_read: None,
+                            cost_cache_write: None,
+                            tool_calling,
+                            reasoning,
+                            vision: false,
+                            family: None,
+                            status: "active".to_string(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Cache persistence
+    // -----------------------------------------------------------------------
+
+    fn save_cache(&self, path: &PathBuf) {
+        if let Ok(json) = serde_json::to_string_pretty(&self.entries) {
+            let _ = std::fs::write(path, json);
+        }
+    }
+
+    /// Load a previously saved cache file, merging entries into the registry.
+    pub fn load_cache(&mut self, path: &PathBuf) {
+        if let Ok(data) = std::fs::read_to_string(path) {
+            if let Ok(entries) =
+                serde_json::from_str::<HashMap<String, ModelEntry>>(&data)
+            {
+                self.entries.extend(entries);
+            }
+        }
+    }
+}
+
+impl Default for ModelRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}

@@ -26,6 +26,7 @@ tokio = { version = "1.44", features = ["full"] }
 tokio-stream = "0.1"
 futures = "0.3"
 async-trait = "0.1"
+async-stream = "0.3"
 
 # HTTP
 reqwest = { version = "0.12", features = ["json", "stream", "native-tls", "multipart"], default-features = false }

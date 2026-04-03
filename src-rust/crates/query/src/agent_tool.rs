@@ -353,6 +353,7 @@ impl Tool for AgentTool {
             skill_index: None,
             max_budget_usd: None,
             fallback_model: None,
+            provider_registry: None,
         };
 
         // -----------------------------------------------------------------------

@@ -247,6 +247,14 @@ struct Cli {
     /// Fallback model to use if the primary model is overloaded or unavailable
     #[arg(long = "fallback-model")]
     fallback_model: Option<String>,
+
+    /// LLM provider to use (default: anthropic). Examples: openai, google, ollama
+    #[arg(long, env = "CLAURST_PROVIDER")]
+    provider: Option<String>,
+
+    /// Override the API base URL for the selected provider
+    #[arg(long, env = "CLAURST_API_BASE")]
+    api_base: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
@@ -336,6 +344,29 @@ async fn main() -> anyhow::Result<()> {
         return handle_auth_command(&raw_args[2..]).await;
     }
 
+    // Fast-path: `claude models` — list all available providers and models.
+    if raw_args.get(1).map(|s| s.as_str()) == Some("models") {
+        let registry = claurst_api::ModelRegistry::new();
+        let mut entries = registry.list_all();
+        // Sort by provider then model id for stable output.
+        entries.sort_by(|a, b| {
+            (&*a.info.provider_id).cmp(&*b.info.provider_id)
+                .then_with(|| (&*a.info.id).cmp(&*b.info.id))
+        });
+        for entry in entries {
+            println!(
+                "{}/{} — {} (ctx: {}K, in: ${:.2}/M, out: ${:.2}/M)",
+                entry.info.provider_id,
+                entry.info.id,
+                entry.info.name,
+                entry.info.context_window / 1000,
+                entry.cost_input.unwrap_or(0.0),
+                entry.cost_output.unwrap_or(0.0),
+            );
+        }
+        return Ok(());
+    }
+
     // Fast-path: named commands (`claude agents`, `claude ide`, `claude branch`, …)
     // Check before Cli::parse() so these names don't conflict with positional prompt arg.
     if let Some(cmd_name) = raw_args.get(1).map(|s| s.as_str()) {
@@ -344,7 +375,7 @@ async fn main() -> anyhow::Result<()> {
             if let Some(named_cmd) = claurst_commands::named_commands::find_named_command(cmd_name) {
                 // Build a minimal CommandContext (named commands are pre-session)
                 let settings = Settings::load().await.unwrap_or_default();
-                let config = settings.config.clone();
+                let config = settings.effective_config();
                 let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
                 let cmd_ctx = claurst_commands::CommandContext {
                     config,
@@ -404,7 +435,7 @@ async fn main() -> anyhow::Result<()> {
     let settings = Settings::load().await.unwrap_or_default();
 
     // Build effective config (CLI args override settings)
-    let mut config = settings.config.clone();
+    let mut config = settings.effective_config();
     if let Some(ref key) = cli.api_key {
         config.api_key = Some(key.clone());
     }
@@ -438,6 +469,18 @@ async fn main() -> anyhow::Result<()> {
         config.auto_compact = false;
     }
     config.project_dir = Some(cwd.clone());
+    if let Some(p) = &cli.provider {
+        config.provider = Some(p.clone());
+    }
+    if let Some(base) = &cli.api_base {
+        // Store in the provider's config entry
+        let provider_id = config.provider.clone().unwrap_or_else(|| "anthropic".to_string());
+        config
+            .provider_configs
+            .entry(provider_id)
+            .or_default()
+            .api_base = Some(base.clone());
+    }
 
     // --dump-system-prompt fast path
     if cli.dump_system_prompt {
@@ -500,9 +543,16 @@ async fn main() -> anyhow::Result<()> {
         ..Default::default()
     };
     let client = Arc::new(
-        claurst_api::AnthropicClient::new(client_config)
+        claurst_api::AnthropicClient::new(client_config.clone())
             .context("Failed to create API client")?,
     );
+
+    // Build provider registry: auto-registers all env-configured providers.
+    // Anthropic is always the default; additional providers (OpenAI, Google,
+    // Bedrock, Azure, Copilot, Cohere, local providers) are registered when
+    // their respective environment variables are set.
+    let provider_registry =
+        claurst_api::ProviderRegistry::from_environment(client_config);
 
     let bridge_config = resolve_bridge_config(&settings, &api_key, use_bearer_auth, is_headless);
     if let Some(cfg) = bridge_config.as_ref() {
@@ -620,6 +670,8 @@ async fn main() -> anyhow::Result<()> {
     if let Some(ref fb) = cli.fallback_model {
         query_config.fallback_model = Some(fb.clone());
     }
+    // Wire in the provider registry so non-Anthropic providers can be dispatched.
+    query_config.provider_registry = Some(std::sync::Arc::new(provider_registry));
 
     // Spawn the background cron scheduler (fires cron tasks at scheduled times).
     // Cancelled automatically when the process exits since we use a shared token.
@@ -823,7 +875,7 @@ async fn run_headless(
 
     while let Some(event) = event_rx.recv().await {
         match &event {
-            QueryEvent::Stream(claurst_api::StreamEvent::ContentBlockDelta {
+            QueryEvent::Stream(claurst_api::AnthropicStreamEvent::ContentBlockDelta {
                 delta: claurst_api::streaming::ContentDelta::TextDelta { text },
                 ..
             }) => {
@@ -1638,7 +1690,7 @@ async fn run_interactive(
             // Forward to bridge before consuming (clone only what we need).
             if let Some(ref runtime) = bridge_runtime {
                 let outbound: Option<BridgeOutbound> = match &evt {
-                    QueryEvent::Stream(claurst_api::StreamEvent::ContentBlockDelta {
+                    QueryEvent::Stream(claurst_api::AnthropicStreamEvent::ContentBlockDelta {
                         delta: claurst_api::streaming::ContentDelta::TextDelta { text },
                         index,
                         ..
@@ -1679,7 +1731,7 @@ async fn run_interactive(
             // This drives the post_bridge_event relay task spawned on Connected.
             if bridge_session_info.is_some() {
                 let relay_payload: Option<String> = match &evt {
-                    QueryEvent::Stream(claurst_api::StreamEvent::ContentBlockDelta {
+                    QueryEvent::Stream(claurst_api::AnthropicStreamEvent::ContentBlockDelta {
                         delta: claurst_api::streaming::ContentDelta::TextDelta { text },
                         ..
                     }) => Some(serde_json::json!({

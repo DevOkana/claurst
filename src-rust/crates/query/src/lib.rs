@@ -36,7 +36,7 @@ pub use session_memory::{
 };
 
 use claurst_api::{
-    ApiMessage, ApiToolDefinition, CreateMessageRequest, StreamAccumulator, StreamEvent,
+    ApiMessage, ApiToolDefinition, AnthropicStreamEvent, CreateMessageRequest, StreamAccumulator,
     StreamHandler, SystemPrompt, ThinkingConfig,
 };
 use claurst_core::config::Config;
@@ -109,6 +109,11 @@ pub struct QueryConfig {
     /// Fallback model name. Used when the primary model returns overloaded /
     /// rate-limit errors (mirrors TS `--fallback-model`).
     pub fallback_model: Option<String>,
+    /// Optional ProviderRegistry for dispatching to non-Anthropic providers.
+    /// When `config.provider` is set to something other than "anthropic" and
+    /// this registry contains that provider, the registry's provider is used
+    /// instead of `AnthropicClient`.
+    pub provider_registry: Option<std::sync::Arc<claurst_api::ProviderRegistry>>,
 }
 
 impl Default for QueryConfig {
@@ -130,6 +135,7 @@ impl Default for QueryConfig {
             skill_index: None,
             max_budget_usd: None,
             fallback_model: None,
+            provider_registry: None,
         }
     }
 }
@@ -154,7 +160,7 @@ impl QueryConfig {
 #[derive(Debug, Clone)]
 pub enum QueryEvent {
     /// A stream event from the API.
-    Stream(StreamEvent),
+    Stream(AnthropicStreamEvent),
     /// A tool is about to be executed.
     ToolStart { tool_name: String, tool_id: String, input_json: String },
     /// A tool has finished executing.
@@ -563,6 +569,41 @@ pub async fn run_query_loop(
             Arc::new(claurst_api::streaming::NullStreamHandler)
         };
 
+        // If a non-Anthropic provider is selected and the registry has it,
+        // dispatch through the registry's LlmProvider rather than the
+        // AnthropicClient.  The Anthropic path below remains unchanged.
+        //
+        // TODO(Phase 4 follow-up): replace this branch with a full streaming
+        // implementation once the unified StreamEvent → AnthropicStreamEvent
+        // bridge is built.  Currently we fall through to the Anthropic path
+        // even when a registry provider is found, because the inner loop
+        // uses AnthropicStreamEvent and StreamAccumulator which are Anthropic-
+        // specific.  The registry hook here establishes the dispatch point so
+        // the wiring can be completed incrementally.
+        if let Some(ref registry) = config.provider_registry {
+            let provider_id_str = effective_model
+                .split('/')
+                .next()
+                .unwrap_or("anthropic");
+            // Check if an explicit non-anthropic provider is configured.
+            // The model field may be "provider/model-id" or just "model-id".
+            // We consult the registry only when the provider is explicitly
+            // non-Anthropic and has a registered entry.
+            let maybe_provider_id = claurst_core::provider_id::ProviderId::new(provider_id_str);
+            if provider_id_str != "anthropic" && registry.get(&maybe_provider_id).is_some() {
+                // TODO: Implement full dispatch through registry provider.
+                // The provider is available via registry.get(&maybe_provider_id).
+                // Call provider.create_message(ProviderRequest { ... }).await
+                // and convert the ProviderResponse back to a Message + UsageInfo.
+                // For now we log a warning and fall through to the Anthropic path.
+                warn!(
+                    provider = %provider_id_str,
+                    model = %effective_model,
+                    "Non-Anthropic provider found in registry — full dispatch pending (Phase 4 follow-up)"
+                );
+            }
+        }
+
         // Send to API
         debug!(turn, model = %effective_model, "Sending API request");
         let mut stream_rx = match client.create_message_stream(request, handler).await {
@@ -609,13 +650,13 @@ pub async fn run_query_loop(
                         Some(evt) => {
                             accumulator.on_event(&evt);
                             match &evt {
-                                StreamEvent::Error { error_type, message } => {
+                                AnthropicStreamEvent::Error { error_type, message } => {
                                     if error_type == "overloaded_error" {
                                         warn!(model = %effective_model, "API overloaded");
                                     }
                                     error!(error_type, message, "Stream error");
                                 }
-                                StreamEvent::MessageStop => break,
+                                AnthropicStreamEvent::MessageStop => break,
                                 _ => {}
                             }
                         }
@@ -1406,7 +1447,7 @@ struct ChannelStreamHandler {
 }
 
 impl StreamHandler for ChannelStreamHandler {
-    fn on_event(&self, event: &StreamEvent) {
+    fn on_event(&self, event: &AnthropicStreamEvent) {
         let _ = self.tx.send(QueryEvent::Stream(event.clone()));
     }
 }
@@ -1436,7 +1477,7 @@ pub async fn run_single_query(
 
     while let Some(evt) = rx.recv().await {
         acc.on_event(&evt);
-        if matches!(evt, StreamEvent::MessageStop) {
+        if matches!(evt, AnthropicStreamEvent::MessageStop) {
             break;
         }
     }

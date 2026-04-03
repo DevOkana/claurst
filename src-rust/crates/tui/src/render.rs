@@ -1090,7 +1090,18 @@ fn render_welcome_box(frame: &mut Frame, app: &App, area: Rect) {
         "Welcome back!".to_string()
     };
     let rustle = rustle_lines(&RustlePose::Default);
-    let model_line = format!("{} \u{00b7} API Usage Billing", app.model_name);
+    // Show provider prefix for non-Anthropic models: "gpt-4o [openai]"
+    // Bare Anthropic model names are shown as-is (Anthropic is the default).
+    let model_display = if let Some((provider, model)) = app.model_name.split_once('/') {
+        if provider == "anthropic" {
+            model.to_string()
+        } else {
+            format!("{} [{}]", model, provider)
+        }
+    } else {
+        app.model_name.clone()
+    };
+    let model_line = format!("{} \u{00b7} API Usage Billing", model_display);
 
     let mut left_lines: Vec<Line> = Vec::new();
     left_lines.push(Line::from(Span::styled(

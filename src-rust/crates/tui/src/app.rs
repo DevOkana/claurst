@@ -72,6 +72,7 @@ const PROMPT_SLASH_COMMANDS: &[(&str, &str)] = &[
     ("output-style", "Toggle output style (auto/stream/verbose)"),
     ("plugin", "Manage plugins (list/info/enable/disable/reload)"),
     ("privacy", "Open privacy settings"),
+    ("providers", "List available AI providers and their status"),
     ("quit", "Quit Claurst"),
     ("rename", "Rename this session"),
     ("resume", "Resume a previous session"),
@@ -3561,7 +3562,7 @@ impl App {
                 }
                 self.is_streaming = true;
                 match stream_evt {
-                    claurst_api::StreamEvent::ContentBlockDelta { delta, .. } => {
+                    claurst_api::AnthropicStreamEvent::ContentBlockDelta { delta, .. } => {
                         // Reset stall timer on any incoming delta — we're making progress.
                         self.stall_start = None;
                         match delta {
@@ -3575,7 +3576,7 @@ impl App {
                             _ => {}
                         }
                     }
-                    claurst_api::StreamEvent::MessageStop => {
+                    claurst_api::AnthropicStreamEvent::MessageStop => {
                         self.is_streaming = false;
                         self.spinner_verb = None;
                         self.stall_start = None;

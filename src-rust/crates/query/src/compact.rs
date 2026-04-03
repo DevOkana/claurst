@@ -20,7 +20,7 @@
 //   the most recent `keep_recent_messages` intact.  This is lighter than a
 //   full compaction and can fire proactively at 75 % capacity.
 
-use claurst_api::{ApiMessage, CreateMessageRequest, StreamAccumulator, StreamEvent, StreamHandler, SystemPrompt};
+use claurst_api::{AnthropicStreamEvent, ApiMessage, CreateMessageRequest, StreamAccumulator, StreamHandler, SystemPrompt};
 use claurst_core::error::ClaudeError;
 use claurst_core::types::{ContentBlock, Message, MessageContent, Role};
 use serde_json::Value;
@@ -618,7 +618,7 @@ async fn summarise_head(
 
     while let Some(evt) = rx.recv().await {
         acc.on_event(&evt);
-        if matches!(evt, StreamEvent::MessageStop) {
+        if matches!(evt, AnthropicStreamEvent::MessageStop) {
             break;
         }
     }
@@ -967,7 +967,7 @@ pub async fn context_collapse(
     client: &claurst_api::AnthropicClient,
     config: &crate::QueryConfig,
 ) -> Result<CompactResult, claurst_core::error::ClaudeError> {
-    use claurst_api::{ApiMessage, CreateMessageRequest, StreamAccumulator, StreamEvent, StreamHandler, SystemPrompt};
+    use claurst_api::{AnthropicStreamEvent, ApiMessage, CreateMessageRequest, StreamAccumulator, StreamHandler, SystemPrompt};
     use serde_json::Value;
     use std::sync::Arc;
 
@@ -1027,7 +1027,7 @@ pub async fn context_collapse(
 
     while let Some(evt) = rx.recv().await {
         acc.on_event(&evt);
-        if matches!(evt, StreamEvent::MessageStop) {
+        if matches!(evt, AnthropicStreamEvent::MessageStop) {
             break;
         }
     }

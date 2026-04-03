@@ -169,6 +169,8 @@ pub struct InsightsCommand;
 pub struct UltrareviewCommand;
 pub struct AdvisorCommand;
 pub struct InstallSlackAppCommand;
+pub struct UndoCommand;
+pub struct ProvidersCommand;
 pub struct NamedCommandAdapter {
     pub slash_name: &'static str,
     pub target_name: &'static str,
@@ -618,17 +620,43 @@ impl SlashCommand for ExitCommand {
 impl SlashCommand for ModelCommand {
     fn name(&self) -> &str { "model" }
     fn description(&self) -> &str { "Show or change the current model" }
+    fn help(&self) -> &str {
+        "Usage: /model [<model-id>]\n\n\
+         Without arguments, shows the current model.\n\n\
+         With a model ID, switches to that model.  Accepts both bare model\n\
+         names (e.g. claude-sonnet-4-6) and provider-prefixed format\n\
+         (e.g. openai/gpt-4o, google/gemini-2.0-flash).\n\n\
+         Examples:\n\
+           /model                        — show current model\n\
+           /model claude-opus-4-6        — switch to Claude Opus 4.6\n\
+           /model openai/gpt-4o          — switch to GPT-4o via OpenAI\n\
+           /model google/gemini-2.0-flash — switch to Gemini 2.0 Flash"
+    }
 
     async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
+        let args = args.trim();
         if args.is_empty() {
             CommandResult::Message(format!(
                 "Current model: {}",
                 ctx.config.effective_model()
             ))
         } else {
+            // Accept both "provider/model" and bare model names.
+            // The config stores the full string (including provider prefix when present)
+            // so that downstream dispatch can route to the correct provider.
+            let model_str = args.to_string();
+            let confirmation = if let Some((provider, model)) = model_str.split_once('/') {
+                if provider == "anthropic" {
+                    format!("Switched to {}", model)
+                } else {
+                    format!("Switched to {}/{}", provider, model)
+                }
+            } else {
+                format!("Switched to {}", model_str)
+            };
             let mut new_config = ctx.config.clone();
-            new_config.model = Some(args.trim().to_string());
-            CommandResult::ConfigChange(new_config)
+            new_config.model = Some(model_str);
+            CommandResult::ConfigChangeMessage(new_config, confirmation)
         }
     }
 }
@@ -2338,7 +2366,7 @@ impl SlashCommand for ReviewCommand {
                 let mut acc = claurst_api::StreamAccumulator::new();
                 while let Some(evt) = rx.recv().await {
                     acc.on_event(&evt);
-                    if matches!(evt, claurst_api::StreamEvent::MessageStop) {
+                    if matches!(evt, claurst_api::AnthropicStreamEvent::MessageStop) {
                         break;
                     }
                 }
@@ -7172,6 +7200,135 @@ impl SlashCommand for NamedCommandAdapter {
     }
 }
 
+// ---- /undo ---------------------------------------------------------------
+
+#[async_trait]
+impl SlashCommand for UndoCommand {
+    fn name(&self) -> &str { "undo" }
+    fn description(&self) -> &str { "Revert file changes made by a tool call in this session" }
+    fn help(&self) -> &str {
+        "Usage: /undo [<tool_use_id>]\n\n\
+         Without an argument, lists all tool calls that modified files in this session.\n\n\
+         With a tool_use_id argument, reverts all file changes made by that specific tool\n\
+         call (restoring files to their state before the tool ran).\n\n\
+         Examples:\n\
+           /undo                   — list recent edits\n\
+           /undo toolu_01XYZ...    — revert that specific tool call"
+    }
+
+    async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
+        // Retrieve the SnapshotManager from the per-session registry.
+        let session_id = ctx.session_id.clone();
+        let snap = claurst_tools::session_snapshot(&session_id);
+        let snap = snap.lock();
+
+        let args = args.trim();
+
+        if args.is_empty() {
+            // List mode: show all recorded tool calls and the files they touched.
+            let changes = snap.list_changes();
+            if changes.is_empty() {
+                return CommandResult::Message(
+                    "No file changes recorded for this session yet.".to_string(),
+                );
+            }
+
+            let mut lines = vec!["Recorded file changes this session:".to_string()];
+            for (id, paths) in &changes {
+                lines.push(format!("  {} ({} file(s)):", id, paths.len()));
+                for p in paths {
+                    lines.push(format!("      {}", p));
+                }
+            }
+            lines.push(String::new());
+            lines.push("Run /undo <tool_use_id> to revert a specific set of changes.".to_string());
+            return CommandResult::Message(lines.join("\n"));
+        }
+
+        // Revert mode.
+        let tool_use_id = args;
+        let (reverted, errors) = snap.revert(tool_use_id);
+
+        if reverted.is_empty() && errors.is_empty() {
+            return CommandResult::Error(format!(
+                "No changes found for tool_use_id '{}'. Use /undo with no arguments to list available IDs.",
+                tool_use_id
+            ));
+        }
+
+        let mut msg = format!(
+            "Reverted {} file(s) for tool call '{}':",
+            reverted.len(),
+            tool_use_id
+        );
+        for p in &reverted {
+            msg.push_str(&format!("\n  {}", p));
+        }
+        if !errors.is_empty() {
+            msg.push_str("\n\nErrors:");
+            for e in &errors {
+                msg.push_str(&format!("\n  {}", e));
+            }
+        }
+
+        CommandResult::Message(msg)
+    }
+}
+
+// ---- /providers -------------------------------------------------------------
+
+#[async_trait]
+impl SlashCommand for ProvidersCommand {
+    fn name(&self) -> &str { "providers" }
+    fn description(&self) -> &str { "List available AI providers and their status" }
+    fn help(&self) -> &str {
+        "Usage: /providers\n\nList all providers registered in the model registry with their\nmodel counts, context windows, and pricing information."
+    }
+
+    async fn execute(&self, _args: &str, _ctx: &mut CommandContext) -> CommandResult {
+        let registry = claurst_api::ModelRegistry::new();
+        let all = registry.list_all();
+
+        if all.is_empty() {
+            return CommandResult::Message("No providers available.".to_string());
+        }
+
+        // Group by provider
+        use std::collections::HashMap;
+        let mut by_provider: HashMap<String, Vec<_>> = HashMap::new();
+        for entry in &all {
+            by_provider
+                .entry(entry.info.provider_id.to_string())
+                .or_default()
+                .push(entry);
+        }
+
+        // Sort providers alphabetically for stable output
+        let mut provider_keys: Vec<String> = by_provider.keys().cloned().collect();
+        provider_keys.sort();
+
+        let mut lines = vec!["Available providers:\n".to_string()];
+        for provider in &provider_keys {
+            let models = &by_provider[provider];
+            lines.push(format!("\n{} ({} model{})", provider.to_uppercase(), models.len(),
+                if models.len() == 1 { "" } else { "s" }));
+            for m in models.iter().take(3) {
+                let cost_str = match (m.cost_input, m.cost_output) {
+                    (Some(i), Some(o)) => format!("${:.2}/${:.2} per 1M", i, o),
+                    _ => "free/local".to_string(),
+                };
+                lines.push(format!("  {} — {}K ctx, {}",
+                    m.info.id, m.info.context_window / 1000, cost_str));
+            }
+            if models.len() > 3 {
+                lines.push(format!("  ... and {} more", models.len() - 3));
+            }
+        }
+
+        CommandResult::Message(lines.join("\n"))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Registry
 // ---------------------------------------------------------------------------
@@ -7339,6 +7496,10 @@ pub fn all_commands() -> Vec<Box<dyn SlashCommand>> {
         Box::new(HeapdumpCommand),
         Box::new(InsightsCommand),
         Box::new(UltrareviewCommand),
+        // Undo / snapshot
+        Box::new(UndoCommand),
+        // Multi-provider support
+        Box::new(ProvidersCommand),
     ]
 }
 
